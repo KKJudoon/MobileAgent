@@ -11,6 +11,7 @@ import json
 import math
 import os
 import subprocess
+import shlex
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -20,7 +21,7 @@ import numpy as np
 from io import BytesIO
 from openai import OpenAI
 from typing import Any, Optional
-from qwen_vl_utils import smart_resize
+from urllib.parse import unquote, urlparse
 
 from PIL import Image, ImageDraw
 
@@ -79,9 +80,12 @@ class AdbTools:
     # -- helpers ----------------------------------------------------------
 
     def _run(self, args):
-        """Run an ADB command string."""
-        cmd = self.adb_path + self._device_flag + args
-        subprocess.run(cmd, capture_output=True, text=True, shell=True)
+        """Run ADB without a host shell and report command failures."""
+        cmd = [self.adb_path]
+        if self.device is not None:
+            cmd.extend(["-s", self.device])
+        cmd.extend(shlex.split(args) if isinstance(args, str) else args)
+        return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
 
     def _load_image_info(self, path):
         """Cache the width and height of the screenshot."""
@@ -95,14 +99,19 @@ class AdbTools:
         Capture a screenshot from the device and save it to *image_path*.
         Returns True on success, False after exhausting retries.
         """
-        device_flag = f" -s {self.device}" if self.device else ""
-        cmd = f"{self.adb_path}{device_flag} exec-out screencap -p > {image_path}"
-
         for _ in range(retry_times):
-            subprocess.run(cmd, capture_output=True, text=True, shell=True)
-            if os.path.exists(image_path):
-                self._load_image_info(image_path)
+            cmd = [self.adb_path]
+            if self.device is not None:
+                cmd.extend(["-s", self.device])
+            try:
+                result = subprocess.run(cmd + ["exec-out", "screencap", "-p"],
+                                        capture_output=True, check=True, timeout=30)
+                with Image.open(BytesIO(result.stdout)) as image:
+                    image.save(image_path)
+                    self.image_info = image.size
                 return True
+            except (OSError, subprocess.SubprocessError):
+                pass
             time.sleep(0.1)
         return False
 
@@ -136,21 +145,26 @@ class AdbTools:
         Type text via ADB Keyboard (supports CJK and Latin characters).
         Requires ADB Keyboard to be installed on the device.
         """
-        escaped_text = text.replace('"', '\\"').replace("'", "\\'")
-        command_sequence = [
-            "shell ime enable com.android.adbkeyboard/.AdbIME",
-            "shell ime set com.android.adbkeyboard/.AdbIME",
-            0.1,  # short delay for IME switch
-            f'shell am broadcast -a ADB_INPUT_TEXT --es msg "{escaped_text}"',
-            0.1,
-            "shell ime disable com.android.adbkeyboard/.AdbIME",
-        ]
-
-        for item in command_sequence:
-            if isinstance(item, (int, float)):
-                time.sleep(item)
-            else:
-                self._run(item.strip())
+        adb_ime = "com.android.adbkeyboard/.AdbIME"
+        previous = self._run(["shell", "settings", "get", "secure",
+                              "default_input_method"]).stdout.strip()
+        enabled = self._run(["shell", "settings", "get", "secure",
+                             "enabled_input_methods"]).stdout.strip()
+        was_enabled = adb_ime in [entry.split(";")[0] for entry in enabled.split(":")]
+        if not previous or previous == "null":
+            raise RuntimeError("Cannot determine the current keyboard; no input was sent")
+        try:
+            self._run(["shell", "ime", "enable", adb_ime])
+            self._run(["shell", "ime", "set", adb_ime])
+            time.sleep(0.2)
+            encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            self._run(["shell", "am", "broadcast", "-a", "ADB_INPUT_B64",
+                       "--es", "msg", encoded])
+            time.sleep(0.2)
+        finally:
+            self._run(["shell", "ime", "set", previous])
+            if not was_enabled:
+                self._run(["shell", "ime", "disable", adb_ime])
 
     # -- package management -----------------------------------------------
 
@@ -160,9 +174,10 @@ class AdbTools:
         If *all_packages* is False, only third-party packages are listed.
         """
         try:
-            flag = "" if all_packages else " -3"
-            cmd = f"{self.adb_path}{self._device_flag}shell pm list packages{flag}"
-            res = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+            args = ["shell", "pm", "list", "packages"]
+            if not all_packages:
+                args.append("-3")
+            res = self._run(args)
             pkgs = []
             for line in res.stdout.splitlines():
                 s = line.strip()
@@ -434,6 +449,11 @@ def pil_to_base64(image):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 def image_to_base64(image_path):
+    if image_path.startswith("file://"):
+        parsed = urlparse(image_path)
+        if parsed.netloc not in ("", "localhost"):
+            raise ValueError("Only local file image references are supported")
+        image_path = unquote(parsed.path)
     dummy_image = Image.open(image_path)
     MIN_PIXELS=3136
     MAX_PIXELS=10035200

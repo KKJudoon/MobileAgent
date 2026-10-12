@@ -13,7 +13,10 @@ Usage:
 import argparse
 import json
 import os
-import shutil
+import re
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
 import time
 
 from PIL import Image
@@ -24,7 +27,6 @@ from utils import (
     annotate_screenshot,
     build_messages,
     resolve_app_name_via_llm,
-    smart_resize,
     GUIOwlWrapper
 )
 
@@ -37,11 +39,14 @@ def parse_args():
                         help="Path to the ADB binary.")
     parser.add_argument("--device", type=str, default=None,
                         help="ADB device serial (optional, for multi-device).")
-    parser.add_argument("--api_key", type=str, required=True,
-                        help="API key for the VLM service.")
-    parser.add_argument("--base_url", type=str, required=True,
+    parser.add_argument("--api_key", type=str,
+                        default=os.environ.get("MOBILE_AGENT_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"),
+                        help="API key (prefer MOBILE_AGENT_API_KEY / DASHSCOPE_API_KEY environment variables).")
+    parser.add_argument("--base_url", type=str,
+                        default=os.environ.get("MOBILE_AGENT_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
                         help="Base URL for the VLM service.")
-    parser.add_argument("--model", type=str, required=True,
+    parser.add_argument("--model", type=str,
+                        default=os.environ.get("MOBILE_AGENT_MODEL", "gui-plus-2026-02-26"),
                         help="Model name for the VLM service.")
     parser.add_argument("--instruction", type=str, required=True,
                         help="Task instruction for the agent.")
@@ -49,13 +54,20 @@ def parse_args():
                         help="Supplementary knowledge (can be empty).")
     parser.add_argument("--max_steps", type=int, default=50,
                         help="Maximum number of interaction steps.")
+    parser.add_argument("--output_dir", type=str, default="runs",
+                        help="Parent directory for uniquely named execution traces.")
     parser.add_argument("--app_resolver_api_key", type=str, default=None,
                         help="API key for the app-resolver LLM (defaults to --api_key).")
     parser.add_argument("--app_resolver_base_url", type=str, default=None,
                         help="Base URL for the app-resolver LLM (defaults to --base_url).")
     parser.add_argument("--app_resolver_model", type=str, default="qwen-plus",
                         help="Model name for the app-resolver LLM.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.api_key:
+        parser.error("Set MOBILE_AGENT_API_KEY or DASHSCOPE_API_KEY before running a task")
+    if args.max_steps < 1:
+        parser.error("--max_steps must be positive")
+    return args
 
 
 def parse_action(output_text):
@@ -64,26 +76,31 @@ def parse_action(output_text):
     Expects a <tool_call> block containing JSON with nested 'arguments'.
     """
     try:
-        tool_call_block = output_text.split("<tool_call>\n")[1]
-        json_str = tool_call_block.split("}}\n")[0] + "}}"
-        return json.loads(json_str)
-    except (IndexError, json.JSONDecodeError) as e:
+        match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", output_text, re.DOTALL)
+        if match is None:
+            raise ValueError("No tool_call block")
+        action = json.loads(match.group(1))
+        if not isinstance(action, dict) or not isinstance(action.get("arguments"), dict):
+            raise ValueError("tool_call must contain an arguments object")
+        if not isinstance(action["arguments"].get("action"), str):
+            raise ValueError("tool_call has no action name")
+        return action
+    except (ValueError, json.JSONDecodeError) as e:
         raise ValueError(f"Failed to parse action from model output: {e}")
 
 
-def rescale_coordinates(action_parameter, resized_width, resized_height):
+def rescale_coordinates(action_parameter, screen_width, screen_height):
     """
     Convert normalized (0-1000) coordinates to actual pixel coordinates
-    based on the resized image dimensions.
+    based on the real device screen dimensions used by ADB.
     """
     for key in ("coordinate", "coordinate1", "coordinate2"):
         if key in action_parameter:
-            action_parameter[key][0] = int(
-                action_parameter[key][0] / 1000 * resized_width
-            )
-            action_parameter[key][1] = int(
-                action_parameter[key][1] / 1000 * resized_height
-            )
+            x, y = action_parameter[key]
+            if not (0 <= x <= 1000 and 0 <= y <= 1000):
+                raise ValueError("Coordinates must be in the 0–1000 range")
+            action_parameter[key] = [min(screen_width - 1, int(x / 1000 * screen_width)),
+                                     min(screen_height - 1, int(y / 1000 * screen_height))]
     return action_parameter
 
 
@@ -152,13 +169,10 @@ def main():
     if args.add_info:
         instruction = f"{instruction} ({args.add_info})"
 
-    task_dir = instruction.replace(" ", "_")[:80]
-    anno_dir = task_dir + "_anno"
-
-    for d in (task_dir, anno_dir):
-        if os.path.exists(d):
-            shutil.rmtree(d)
-        os.makedirs(d)
+    run_name = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
+    task_dir = str(Path(args.output_dir).resolve() / run_name)
+    anno_dir = os.path.join(task_dir, "annotated")
+    os.makedirs(anno_dir)
 
     # App-resolver LLM config (falls back to main config)
     resolver_api_key = args.app_resolver_api_key or args.api_key
@@ -195,13 +209,7 @@ def main():
 
         # 4. Rescale coordinates from 1000x1000 to actual resolution
         img = Image.open(screenshot_path)
-        resized_h, resized_w = smart_resize(
-            img.height, img.width,
-            factor=16,
-            min_pixels=3136,
-            max_pixels=1003520 * 200,
-        )
-        action_parameter = rescale_coordinates(action_parameter, resized_w, resized_h)
+        action_parameter = rescale_coordinates(action_parameter, img.width, img.height)
 
         # 5. Execute the action
         action_type = action_parameter["action"]

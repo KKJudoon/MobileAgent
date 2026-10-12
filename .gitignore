@@ -5,3 +5,11 @@ __pycache__/
 **/screenshot/*
 **/temp/*
 logs/*
+
+# Local API runtime, credentials, device evidence and generated traces
+.venv/
+.env
+.env.*
+!.env.example
+local/
+runs/

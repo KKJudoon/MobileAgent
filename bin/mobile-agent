@@ -1,0 +1,13 @@
+#!/bin/sh
+# Resolve the install root through the launcher, including a ~/.local/bin symlink.
+TASK_LAUNCHER_PATH="$0"
+while [ -L "$TASK_LAUNCHER_PATH" ]; do
+    TASK_LAUNCHER_DIR=$(CDPATH= cd -- "$(dirname -- "$TASK_LAUNCHER_PATH")" && pwd)
+    TASK_LINK_TARGET=$(readlink "$TASK_LAUNCHER_PATH")
+    case "$TASK_LINK_TARGET" in
+        /*) TASK_LAUNCHER_PATH="$TASK_LINK_TARGET" ;;
+        *) TASK_LAUNCHER_PATH="$TASK_LAUNCHER_DIR/$TASK_LINK_TARGET" ;;
+    esac
+done
+TASK_INSTALL_ROOT=$(CDPATH= cd -- "$(dirname -- "$TASK_LAUNCHER_PATH")/.." && pwd)
+exec "$TASK_INSTALL_ROOT/.venv/bin/python" "$TASK_INSTALL_ROOT/tools/mobile_agent.py" "$@"

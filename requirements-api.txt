@@ -1,0 +1,5 @@
+# Only the dependencies imported by Mobile-Agent-v3.5/mobile_use.
+# API inference needs neither PyTorch nor a local model checkpoint.
+openai~=3.29.0
+Pillow~=12.3.0
+numpy~=2.5.4
